@@ -47,7 +47,9 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import re
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -822,6 +824,9 @@ class KmaApiClient:
         self._auth_key = auth_key
         self._base_url = base_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._aws: list[tuple[float, float, str]] = []    # (위도, 경도, 시·군 예보구역) — 구역끼리 나눠 쓴다
+        self._aws_at = 0.0
+        self._aws_lock = asyncio.Lock()
 
     async def _do_request(
         self, endpoint: str, params: dict[str, Any]
@@ -962,6 +967,33 @@ class KmaApiClient:
             )
         _LOGGER.debug("육상예보 %d구간 파싱(reg=%s)", len(out), reg)
         return out
+
+    async def async_get_forecast_reg_near(self, lat: float, lon: float) -> str | None:
+        """좌표에서 가장 가까운 AWS 관측소의 시·군 예보구역 코드. [실측 검증 2026-09-24]
+
+        stn_inf.php?inf=AWS 는 관측소마다 예보구역을 준다(예: 하이 34.92/128.12 → 11H20404 고성).
+        도 단위 대표 구역(land_reg)보다 좁아 육상·중기예보를 그 구역 것으로 받을 수 있다.
+        목록은 하루 한 번만 받는다. '00'으로 끝나는 광역 구역(산지 등)은 뺀다.
+        """
+        async with self._aws_lock:
+            if not self._aws or time.monotonic() - self._aws_at > 86400:
+                text = await self._request("stn_inf.php", {
+                    "inf": "AWS", "stn": "", "tm": _now_kst().strftime("%Y%m%d%H%M"), "help": 0})
+                rows = []
+                for line in iter_data_lines(text):
+                    t = line.split()
+                    reg = next((x for x in t if re.fullmatch(r"11[A-Z]\d{5}", x)), None)
+                    try:
+                        lon_, lat_ = float(t[1]), float(t[2])
+                    except (IndexError, ValueError):
+                        continue
+                    if reg and not reg.endswith("00"):
+                        rows.append((lat_, lon_, reg))
+                self._aws, self._aws_at = rows, time.monotonic()
+        if not self._aws:
+            return None
+        k = math.cos(math.radians(lat))           # 경도 1도 거리 보정(평면 근사, 수 km 안에서는 충분)
+        return min(self._aws, key=lambda r: (r[0] - lat) ** 2 + ((r[1] - lon) * k) ** 2)[2]
 
     async def async_get_mid_forecast(self, land_reg: str) -> list[MidForecast]:
         """중기예보 조회: MidFcstInfoService getMidLandFcst(날씨·강수확률) + getMidTa(기온). [실측 검증 2026-09-24]

@@ -130,6 +130,9 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
         # API별 누적 에러 카운트 / 마지막 에러 시각 (HA 재시작 전까지 유지)
         self._init_api_status(API_STATUS_ZONE_KEYS)
         self._mid_next = 0.0      # 중기예보 다음 조회 시각(monotonic). 하루 두 번 발표라 자주 볼 필요 없다
+        # 시·군 예보구역: 구역 좌표에서 가장 가까운 AWS 관측소의 구역(예: 고성군 → 11H20404).
+        # 육상·중기예보만 이것을 쓰고, 미세먼지·특보 등 도 단위 표는 land_reg 를 그대로 쓴다
+        self.forecast_reg: str | None = None
         self._refresh_meta: dict[str, bool] = {
             "village_stale": False,
             "land_stale": False,
@@ -230,8 +233,15 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
         # {FIRST_REFRESH_DEADLINE}초 안에 못 받은 항목을 비워 두고 먼저 올라오며, 다음 갱신 때 받는다.
         # 아래 항목별 처리(이전 값 유지 등)는 예전과 같고, 결과만 여기서 미리 받아 둔다.
         c = self.client
+        # 시·군 예보구역은 첫 조회 다음부터 한 번 찾는다(관측소 목록은 클라이언트가 하루 한 번 받아 구역끼리 나눠 씀)
+        if self.data is not None and self.forecast_reg is None:
+            try:
+                self.forecast_reg = await c.async_get_forecast_reg_near(self.lat, self.lon) or self.land_reg
+                _LOGGER.debug("%s 예보구역: %s", self.subentry.title, self.forecast_reg)
+            except KmaApiError as err:
+                _LOGGER.debug("예보구역 찾기 실패(다음 갱신 때 다시): %s", err)
         optional_jobs = {
-            "land": ("육상예보", lambda: c.async_get_land_forecast(self.land_reg), []),
+            "land": ("육상예보", lambda: c.async_get_land_forecast(self.forecast_reg or self.land_reg), []),
             "marine": ("해상예보", lambda: c.async_get_marine_forecast(self.marine_reg), []),
             "pm10": ("미세먼지(PM10)", lambda: c.async_get_pm10_now(stn=self.stn), None),
             "uv_index": ("자외선지수", lambda: c.async_get_uv_index(area_no=self.area_no), None),
@@ -413,7 +423,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
         if time.monotonic() < self._mid_next:
             return prev
         try:
-            mid = await self.client.async_get_mid_forecast(self.land_reg)
+            mid = await self.client.async_get_mid_forecast(self.forecast_reg or self.land_reg)
         except KmaActivationRequiredError:
             _LOGGER.debug("중기예보 미신청(403). 6시간 뒤 다시 확인합니다.")
             self._mid_next = time.monotonic() + 6 * 3600

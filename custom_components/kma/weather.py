@@ -401,6 +401,9 @@ class KmaWeather(CoordinatorEntity[KmaForecastCoordinator], WeatherEntity):
             # 구역 좌표: 카드가 기상청 예보 이후 날짜를 다른 출처로 채울 때 쓴다
             "latitude": self.coordinator.lat,
             "longitude": self.coordinator.lon,
+            # 어느 HA 구역(zone.*)의 날씨인지, 육상·중기예보를 받는 시·군 예보구역
+            "zone_id": self.coordinator.subentry.data.get("zone_id"),
+            "forecast_region": self.coordinator.forecast_reg or self.coordinator.land_reg,
         }
 
         # 1. 육상예보 요약
