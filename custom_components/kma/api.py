@@ -127,7 +127,7 @@ class LandForecast:
 
 @dataclass(frozen=True)
 class MidForecast:
-    """중기예보 하루치: 육상(fct_afs_wl.php) + 기온(fct_afs_wc.php)을 날짜로 합친 것."""
+    """중기예보 하루치: getMidLandFcst(날씨·강수확률) + getMidTa(기온)를 날짜로 합친 것."""
 
     date: str               # YYYYMMDD
     wf: str                 # 예보 문구 (예: "구름많고 비")
@@ -150,13 +150,6 @@ _MID_LAND_REG = {
 def mid_land_reg(land_reg: str) -> str | None:
     return _MID_LAND_REG.get(land_reg[:4]) or _MID_LAND_REG.get(land_reg[:3])
 
-
-def _mid_cols(line: str) -> list[str]:
-    """disp=1 응답 한 줄: 쉼표 구분, 끝에 '=' 가 붙는다."""
-    cols = [c.strip() for c in line.split(",")]
-    while cols and cols[-1] in ("", "="):
-        cols.pop()
-    return cols
 
 
 @dataclass(frozen=True)
@@ -971,46 +964,61 @@ class KmaApiClient:
         return out
 
     async def async_get_mid_forecast(self, land_reg: str) -> list[MidForecast]:
-        """중기예보(4~10일 뒤) 조회. [활용신청 필요 — 2026-09-24 키 기준 403]
+        """중기예보 조회: MidFcstInfoService getMidLandFcst(날씨·강수확률) + getMidTa(기온). [실측 검증 2026-09-24]
 
-        열 순서는 apihub 문서·공개 코드 기준(실응답 미검증):
-          wl: REG_ID TM_FC TM_EF MOD STN C SKY PRE CONF WF RN_ST
-          wc: REG_ID TM_FC TM_EF MOD STN C MIN MAX MIN_L MIN_H MAX_L MAX_H
-        가장 최근 발표분만 쓰고, 오전·오후(A02)로 나뉜 날은 하루로 합친다.
+        06·18시 발표. 발표일 기준 5~10일 뒤(wf5Am·wf5Pm … wf8·wf9·wf10, taMin5 … taMax10).
+        가장 최근 발표분이 아직 없으면(NO_DATA) 바로 전 발표분을 쓴다.
         """
         reg = mid_land_reg(land_reg)
         if not reg:
             return []
-        land_txt = await self._request("fct_afs_wl.php", {"reg": reg, "disp": 1, "help": 0})
-        ta_txt = await self._request("fct_afs_wc.php", {"reg": land_reg, "disp": 1, "help": 0})
-
-        def latest(txt: str) -> list[list[str]]:
-            rows = [c for c in (_mid_cols(x) for x in iter_data_lines(txt)) if len(c) >= 8]
-            top = max((r[1] for r in rows), default="")
-            return [r for r in rows if r[1] == top]
-
-        days: dict[str, dict[str, Any]] = {}
-        for c in latest(land_txt):
-            d = days.setdefault(c[2][:8], {"wf": [], "pop": []})
-            # WF 는 CONF 뒤의 한글 열. CONF 가 "없음" 이면 "없음 구름많음" 처럼 붙어 오기도 한다
-            texts = [re.sub(r"^없음\s+", "", x) for x in c[8:] if re.search("[가-힣]", x)]
-            texts = [x for x in texts if x and x != "없음"]
-            if texts:
-                d["wf"].append(texts[-1])
-            if c[-1].isdigit():
-                d["pop"].append(int(c[-1]))
-        for c in latest(ta_txt):
-            d = days.setdefault(c[2][:8], {"wf": [], "pop": []})
-            d["min"], d["max"] = _to_int(c[6]), _to_int(c[7])
+        now = _now_kst()
+        today, yday = now.strftime("%Y%m%d"), (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        if now.hour >= 18:
+            tms = [today + "1800", today + "0600"]
+        elif now.hour >= 6:
+            tms = [today + "0600", yday + "1800"]
+        else:
+            tms = [yday + "1800", yday + "0600"]
+        land: dict[str, Any] = {}
+        for tm in tms:
+            items = await self._mid_items("getMidLandFcst", reg, tm)
+            if items:
+                land = items[0]
+                break
+        if not land:
+            return []
+        ta_items = await self._mid_items("getMidTa", land_reg, tm)
+        ta = ta_items[0] if ta_items else {}
 
         def worst(wfs: list[str]) -> str:     # 오전·오후 중 비·눈이 있는 쪽을 대표로
-            return next((w for w in wfs if re.search("비|눈|소나기", w)), wfs[-1] if wfs else "")
+            return next((w for w in wfs if re.search("비|눈|소나기", w)), wfs[-1])
 
-        out = [MidForecast(date=k, wf=worst(v["wf"]), pop=max(v["pop"]) if v["pop"] else None,
-                           ta_min=v.get("min"), ta_max=v.get("max"))
-               for k, v in sorted(days.items()) if v["wf"] or v.get("max") is not None]
-        _LOGGER.debug("중기예보 %d일 파싱(reg=%s/%s)", len(out), reg, land_reg)
+        def num(v: Any) -> int | None:
+            return v if isinstance(v, int) else _to_int(str(v)) if v not in (None, "") else None
+
+        base = datetime.datetime.strptime(tm[:8], "%Y%m%d")
+        out: list[MidForecast] = []
+        for n in range(3, 11):
+            wfs = [land[k] for k in (f"wf{n}Am", f"wf{n}Pm", f"wf{n}") if land.get(k)]
+            if not wfs:
+                continue
+            pops = [p for p in (num(land.get(k)) for k in (f"rnSt{n}Am", f"rnSt{n}Pm", f"rnSt{n}")) if p is not None]
+            out.append(MidForecast(
+                date=(base + datetime.timedelta(days=n)).strftime("%Y%m%d"),
+                wf=worst(wfs), pop=max(pops) if pops else None,
+                ta_min=num(ta.get(f"taMin{n}")), ta_max=num(ta.get(f"taMax{n}")),
+            ))
+        _LOGGER.debug("중기예보 %d일 파싱(발표 %s, reg=%s/%s)", len(out), tm, reg, land_reg)
         return out
+
+    async def _mid_items(self, op: str, reg_id: str, tm_fc: str) -> list[dict[str, Any]]:
+        text = await self._request(
+            f"api/typ02/openApi/MidFcstInfoService/{op}",
+            {"pageNo": 1, "numOfRows": 10, "dataType": "JSON", "regId": reg_id, "tmFc": tm_fc},
+            is_json_api=True,
+        )
+        return _parse_typ02_items(text, op)
 
     async def async_get_marine_forecast(
         self, reg: str, *, tmfc1: str | None = None, tmfc2: str | None = None
