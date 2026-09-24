@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .concurrency import FIRST_REFRESH_DEADLINE, run_concurrently
 from .api import (
     KmaActivationRequiredError,
     KmaApiClient,
@@ -223,10 +224,40 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             refresh_meta["ultra_stale"] = True
         data["ultra"] = ultra or (self.data or {}).get("ultra", [])
 
-        # 2. 육상예보 (fct_afs_dl.php)
-        land, status["land_forecast"] = await self._fetch_optional(
-            "육상예보", self.client.async_get_land_forecast(self.land_reg), default=[]
+        # 2~4. 선택 항목은 서로 독립이라 동시에 받는다(최대 4개씩). 첫 조회에서는
+        # {FIRST_REFRESH_DEADLINE}초 안에 못 받은 항목을 비워 두고 먼저 올라오며, 다음 갱신 때 받는다.
+        # 아래 항목별 처리(이전 값 유지 등)는 예전과 같고, 결과만 여기서 미리 받아 둔다.
+        c = self.client
+        optional_jobs = {
+            "land": ("육상예보", lambda: c.async_get_land_forecast(self.land_reg), []),
+            "marine": ("해상예보", lambda: c.async_get_marine_forecast(self.marine_reg), []),
+            "pm10": ("미세먼지(PM10)", lambda: c.async_get_pm10_now(stn=self.stn), None),
+            "uv_index": ("자외선지수", lambda: c.async_get_uv_index(area_no=self.area_no), None),
+            "air_stagnation": ("대기정체지수", lambda: c.async_get_air_stagnation_index(area_no=self.area_no), None),
+            "oak_pollen": ("꽃가루(참나무)", lambda: c.async_get_oak_pollen_risk(area_no=self.area_no), None),
+            "pine_pollen": ("꽃가루(소나무)", lambda: c.async_get_pine_pollen_risk(area_no=self.area_no), None),
+            "weed_pollen": ("꽃가루(잡초류)", lambda: c.async_get_weed_pollen_risk(area_no=self.area_no), None),
+            "radar_precipitation": ("레이더 강수강도",
+                                    lambda: c.async_get_radar_precipitation(dong_code=self.area_no), None),
+            "sfc_observation": ("고해상도 지상관측",
+                                lambda: c.async_get_sfc_observation(lat=self.lat, lon=self.lon), None),
+            "heat_wave_risk": ("영향예보(폭염)", lambda: c.async_get_heat_wave_risk(stn=self.office_stn), None),
+            "cold_wave_risk": ("영향예보(한파)", lambda: c.async_get_cold_wave_risk(stn=self.office_stn), None),
+            "hazard_info": ("기상정보", lambda: c.async_get_hazard_info(stn=self.office_stn), None),
+            "weather_commentary": ("날씨해설", lambda: c.async_get_weather_commentary(stn=self.office_stn), None),
+            "snow_depth": ("적설관측", lambda: c.async_get_snow_depth(stn=self.stn), None),
+            "pm10_hourly": ("미세먼지 시간통계", lambda: c.async_get_pm10_hourly_stats(stn=self.stn), None),
+            "warning_now": ("기상특보", lambda: c.async_get_warning_now(), []),
+        }
+        opt = await run_concurrently(
+            {k: (lambda lb=lb, fn=fn, d=d: self._fetch_optional(lb, fn(), default=d))
+              for k, (lb, fn, d) in optional_jobs.items()},
+            first=self.data is None,
+            skipped=lambda k: (optional_jobs[k][2], f"error: 첫 조회에서 {FIRST_REFRESH_DEADLINE}초 안에 받지 못함(다음 갱신 때 받음)"),
         )
+
+        # 2. 육상예보 (fct_afs_dl.php)
+        land, status["land_forecast"] = opt["land"]
         if not land and self.data and "land" in self.data:
             data["land"] = self.data["land"]
             refresh_meta["land_stale"] = True
@@ -235,9 +266,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["land"] = land
 
         # 3. 해상예보 (fct_afs_do.php)
-        marine, status["marine_forecast"] = await self._fetch_optional(
-            "해상예보", self.client.async_get_marine_forecast(self.marine_reg), default=[]
-        )
+        marine, status["marine_forecast"] = opt["marine"]
         if not marine and self.data and "marine" in self.data:
             data["marine"] = self.data["marine"]
             refresh_meta["marine_stale"] = True
@@ -246,9 +275,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["marine"] = marine
 
         # 3-2. PM10(미세먼지) 관측 (kma_pm10.php) [실측 검증 2026-07-01]
-        pm10_obs, status["pm10"] = await self._fetch_optional(
-            "미세먼지(PM10)", self.client.async_get_pm10_now(stn=self.stn), default=None
-        )
+        pm10_obs, status["pm10"] = opt["pm10"]
         if pm10_obs is None and self.data and "pm10" in self.data:
             data["pm10"] = self.data["pm10"]
             refresh_meta["pm10_stale"] = True
@@ -257,18 +284,14 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["pm10"] = pm10_obs
 
         # 3-3. 자외선지수/대기정체지수 (연중 제공 — 실패 시 이전 값 유지)
-        uv_obs, status["uv_index"] = await self._fetch_optional(
-            "자외선지수", self.client.async_get_uv_index(area_no=self.area_no), default=None
-        )
+        uv_obs, status["uv_index"] = opt["uv_index"]
         if uv_obs is None and self.data and "uv_index" in self.data:
             data["uv_index"] = self.data["uv_index"]
             refresh_meta["uv_index_stale"] = True
         else:
             data["uv_index"] = uv_obs
 
-        air_obs, status["air_stagnation"] = await self._fetch_optional(
-            "대기정체지수", self.client.async_get_air_stagnation_index(area_no=self.area_no), default=None
-        )
+        air_obs, status["air_stagnation"] = opt["air_stagnation"]
         if air_obs is None and self.data and "air_stagnation" in self.data:
             data["air_stagnation"] = self.data["air_stagnation"]
             refresh_meta["air_stagnation_stale"] = True
@@ -277,30 +300,20 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
 
         # 3-4. 꽃가루농도위험지수 3종 (계절 서비스 — 비시즌 None은 정상 상태이므로
         # 이전 값을 이어붙이지 않는다. 이어붙이면 시즌 종료 후에도 옛 값이 남아 오해를 준다).
-        oak_obs, status["oak_pollen"] = await self._fetch_optional(
-            "꽃가루(참나무)", self.client.async_get_oak_pollen_risk(area_no=self.area_no), default=None
-        )
+        oak_obs, status["oak_pollen"] = opt["oak_pollen"]
         data["oak_pollen"] = oak_obs
 
-        pine_obs, status["pine_pollen"] = await self._fetch_optional(
-            "꽃가루(소나무)", self.client.async_get_pine_pollen_risk(area_no=self.area_no), default=None
-        )
+        pine_obs, status["pine_pollen"] = opt["pine_pollen"]
         data["pine_pollen"] = pine_obs
 
-        weed_obs, status["weed_pollen"] = await self._fetch_optional(
-            "꽃가루(잡초류)", self.client.async_get_weed_pollen_risk(area_no=self.area_no), default=None
-        )
+        weed_obs, status["weed_pollen"] = opt["weed_pollen"]
         data["weed_pollen"] = weed_obs
 
         # 3-5. 행정구역별 레이더 강수강도 (WthrRadarInfoService/getCompCappiQcdArea)
         # 실측 결과 특정 지역(광주, 구코드 2900000000 — 통합특별시 개편으로 대체된
         # 레거시 코드)에서 간헐적으로 오류가 발생함이 확인되어(2026-07-01), 실패 시
         # 이전 값을 유지한다.
-        radar_obs, status["radar_precipitation"] = await self._fetch_optional(
-            "레이더 강수강도",
-            self.client.async_get_radar_precipitation(dong_code=self.area_no),
-            default=None,
-        )
+        radar_obs, status["radar_precipitation"] = opt["radar_precipitation"]
         if radar_obs is None and self.data and "radar_precipitation" in self.data:
             data["radar_precipitation"] = self.data["radar_precipitation"]
             refresh_meta["radar_precipitation_stale"] = True
@@ -308,11 +321,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["radar_precipitation"] = radar_obs
 
         # 3-6. 고해상도 지상관측 (sfc_nc_var.php) [실측 검증 2026-07-02]
-        sfc_obs, status["sfc_observation"] = await self._fetch_optional(
-            "고해상도 지상관측",
-            self.client.async_get_sfc_observation(lat=self.lat, lon=self.lon),
-            default=None,
-        )
+        sfc_obs, status["sfc_observation"] = opt["sfc_observation"]
         if sfc_obs is None and self.data and "sfc_observation" in self.data:
             data["sfc_observation"] = self.data["sfc_observation"]
             refresh_meta["sfc_observation_stale"] = True
@@ -321,32 +330,22 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
 
         # 3-7. 영향예보 폭염/한파 (ifs_fct_pstt.php) [실측 검증 2026-07-02]
         # 비시즌에는 위험구역이 없어 level=None이 정상 상태이므로 이전 값을 이어붙이지 않는다.
-        heat_obs, status["heat_wave_risk"] = await self._fetch_optional(
-            "영향예보(폭염)", self.client.async_get_heat_wave_risk(stn=self.office_stn), default=None
-        )
+        heat_obs, status["heat_wave_risk"] = opt["heat_wave_risk"]
         data["heat_wave_risk"] = heat_obs
 
-        cold_obs, status["cold_wave_risk"] = await self._fetch_optional(
-            "영향예보(한파)", self.client.async_get_cold_wave_risk(stn=self.office_stn), default=None
-        )
+        cold_obs, status["cold_wave_risk"] = opt["cold_wave_risk"]
         data["cold_wave_risk"] = cold_obs
 
         # 3-8. 기상정보/날씨해설 (관서별 텍스트 속보) [실측 검증 2026-07-02]
         # 최근 24시간 내 발표분이 없으면 None이 정상 상태이므로 이전 값을 이어붙이지 않는다.
-        hazard_obs, status["hazard_info"] = await self._fetch_optional(
-            "기상정보", self.client.async_get_hazard_info(stn=self.office_stn), default=None
-        )
+        hazard_obs, status["hazard_info"] = opt["hazard_info"]
         data["hazard_info"] = hazard_obs
 
-        commentary_obs, status["weather_commentary"] = await self._fetch_optional(
-            "날씨해설", self.client.async_get_weather_commentary(stn=self.office_stn), default=None
-        )
+        commentary_obs, status["weather_commentary"] = opt["weather_commentary"]
         data["weather_commentary"] = commentary_obs
 
         # 3-9. 적설관측 (kma_snow1.php) [실측 검증 2026-07-02]
-        snow_obs, status["snow_depth"] = await self._fetch_optional(
-            "적설관측", self.client.async_get_snow_depth(stn=self.stn), default=None
-        )
+        snow_obs, status["snow_depth"] = opt["snow_depth"]
         if snow_obs is None and self.data and "snow_depth" in self.data:
             data["snow_depth"] = self.data["snow_depth"]
             refresh_meta["snow_depth_stale"] = True
@@ -354,9 +353,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["snow_depth"] = snow_obs
 
         # 3-10. 미세먼지(PM10) 시간통계 (dst_pm10_hr.php) [실측 검증 2026-07-02]
-        pm10_hourly_obs, status["pm10_hourly"] = await self._fetch_optional(
-            "미세먼지 시간통계", self.client.async_get_pm10_hourly_stats(stn=self.stn), default=None
-        )
+        pm10_hourly_obs, status["pm10_hourly"] = opt["pm10_hourly"]
         if pm10_hourly_obs is None and self.data and "pm10_hourly" in self.data:
             data["pm10_hourly"] = self.data["pm10_hourly"]
             refresh_meta["pm10_hourly_stale"] = True
@@ -364,9 +361,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             data["pm10_hourly"] = pm10_hourly_obs
 
         # 4. 특보현황 (wrn_now_data.php)
-        warnings, status["warning_now"] = await self._fetch_optional(
-            "기상특보", self.client.async_get_warning_now(), default=[]
-        )
+        warnings, status["warning_now"] = opt["warning_now"]
         # 특보 호출 실패 시에는 이전 특보 데이터를 유지하고, 성공했으나 내용이 없는 경우는 빈 목록으로 업데이트합니다.
         if status["warning_now"].startswith("error") and self.data and "warnings" in self.data:
             data["warnings"] = self.data["warnings"]
@@ -620,32 +615,23 @@ class KmaImageCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, Any]]
         data: dict[str, Any] = dict(self.data or dict.fromkeys(API_STATUS_IMAGE_KEYS))
         status: dict[str, str] = {}
 
-        status["radar"] = await self._fetch_image(
-            data, "radar", "레이더 이미지", self.client.async_get_radar_image()
-        )
-        status["satellite"] = await self._fetch_image(
-            data, "satellite", "위성 이미지", self.client.async_get_satellite_image()
-        )
-        status["precipitation_forecast"] = await self._fetch_image(
-            data, "precipitation_forecast", "강수예측 이미지",
-            self.client.async_get_precipitation_forecast_image(),
-        )
-        status["satellite_visible"] = await self._fetch_image(
-            data, "satellite_visible", "위성 가시광선 이미지",
-            self.client.async_get_satellite_image(obs="vi006"),
-        )
-        status["satellite_shortwave_ir"] = await self._fetch_image(
-            data, "satellite_shortwave_ir", "위성 단파적외 이미지",
-            self.client.async_get_satellite_image(obs="sw038"),
-        )
-        status["satellite_water_vapor"] = await self._fetch_image(
-            data, "satellite_water_vapor", "위성 수증기 이미지",
-            self.client.async_get_satellite_image(obs="wv069"),
-        )
-        status["dust_satellite"] = await self._fetch_image(
-            data, "dust_satellite", "황사위성영상",
-            self.client.async_get_dust_satellite_image(),
-        )
+        # 이미지 7종도 동시에 받는다(첫 조회는 {FIRST_REFRESH_DEADLINE}초까지만 기다림).
+        c = self.client
+        image_jobs = {
+            "radar": ("레이더 이미지", lambda: c.async_get_radar_image()),
+            "satellite": ("위성 이미지", lambda: c.async_get_satellite_image()),
+            "precipitation_forecast": ("강수예측 이미지", lambda: c.async_get_precipitation_forecast_image()),
+            "satellite_visible": ("위성 가시광선 이미지", lambda: c.async_get_satellite_image(obs="vi006")),
+            "satellite_shortwave_ir": ("위성 단파적외 이미지", lambda: c.async_get_satellite_image(obs="sw038")),
+            "satellite_water_vapor": ("위성 수증기 이미지", lambda: c.async_get_satellite_image(obs="wv069")),
+            "dust_satellite": ("황사위성영상", lambda: c.async_get_dust_satellite_image()),
+        }
+        status.update(await run_concurrently(
+            {k: (lambda k=k, lb=lb, fn=fn: self._fetch_image(data, k, lb, fn()))
+              for k, (lb, fn) in image_jobs.items()},
+            first=self.data is None,
+            skipped=lambda k: f"error: 첫 조회에서 {FIRST_REFRESH_DEADLINE}초 안에 받지 못함(다음 갱신 때 받음)",
+        ))
 
         data["api_status"] = status
         self._record_api_status(status)
@@ -676,15 +662,18 @@ class KmaHubCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, Any]]):
         data: dict[str, Any] = dict(self.data or dict.fromkeys(API_STATUS_HUB_KEYS))
         status: dict[str, str] = {}
 
-        eq_obs, status["earthquake"] = await self._fetch_optional(
-            "지진정보", self.client.async_get_earthquake_recent(), default=None
+        c = self.client
+        hub = await run_concurrently(
+            {"earthquake": lambda: self._fetch_optional("지진정보", c.async_get_earthquake_recent(), default=None),
+             "typhoon": lambda: self._fetch_optional("태풍정보", c.async_get_typhoon_now(), default=None)},
+            first=self.data is None,
+            skipped=lambda k: (None, f"error: 첫 조회에서 {FIRST_REFRESH_DEADLINE}초 안에 받지 못함(다음 갱신 때 받음)"),
         )
+        eq_obs, status["earthquake"] = hub["earthquake"]
         if eq_obs is not None:
             data["earthquake"] = eq_obs
 
-        typhoon_obs, status["typhoon"] = await self._fetch_optional(
-            "태풍정보", self.client.async_get_typhoon_now(), default=None
-        )
+        typhoon_obs, status["typhoon"] = hub["typhoon"]
         # 활성 태풍이 없는 것은 정상 상태이므로, API 호출 자체가 성공(ok)했다면
         # 이전 값을 이어붙이지 않고 그대로 None(없음)으로 갱신한다.
         if status["typhoon"] == "ok":
