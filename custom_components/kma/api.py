@@ -126,6 +126,40 @@ class LandForecast:
 
 
 @dataclass(frozen=True)
+class MidForecast:
+    """중기예보 하루치: 육상(fct_afs_wl.php) + 기온(fct_afs_wc.php)을 날짜로 합친 것."""
+
+    date: str               # YYYYMMDD
+    wf: str                 # 예보 문구 (예: "구름많고 비")
+    pop: int | None         # 강수확률(%). 오전·오후로 나뉘면 큰 값
+    ta_min: int | None
+    ta_max: int | None
+
+
+# 단기 육상예보 구역(예: 11H20201 부산) → 중기 육상예보 광역 구역
+_MID_LAND_REG = {
+    "11B": "11B00000",   # 서울·인천·경기
+    "11D1": "11D10000", "11D2": "11D20000",   # 강원 영서·영동
+    "11C1": "11C10000", "11C2": "11C20000",   # 충북·충남(대전·세종)
+    "11F1": "11F10000", "11F2": "11F20000",   # 전북·전남(광주)
+    "11H1": "11H10000", "11H2": "11H20000",   # 경북(대구)·경남(부산·울산)
+    "11G": "11G00000",   # 제주
+}
+
+
+def mid_land_reg(land_reg: str) -> str | None:
+    return _MID_LAND_REG.get(land_reg[:4]) or _MID_LAND_REG.get(land_reg[:3])
+
+
+def _mid_cols(line: str) -> list[str]:
+    """disp=1 응답 한 줄: 쉼표 구분, 끝에 '=' 가 붙는다."""
+    cols = [c.strip() for c in line.split(",")]
+    while cols and cols[-1] in ("", "="):
+        cols.pop()
+    return cols
+
+
+@dataclass(frozen=True)
 class MarineForecast:
     """단기 해상예보 1구간 (fct_afs_do.php).
 
@@ -934,6 +968,48 @@ class KmaApiClient:
                 )
             )
         _LOGGER.debug("육상예보 %d구간 파싱(reg=%s)", len(out), reg)
+        return out
+
+    async def async_get_mid_forecast(self, land_reg: str) -> list[MidForecast]:
+        """중기예보(4~10일 뒤) 조회. [활용신청 필요 — 2026-09-24 키 기준 403]
+
+        열 순서는 apihub 문서·공개 코드 기준(실응답 미검증):
+          wl: REG_ID TM_FC TM_EF MOD STN C SKY PRE CONF WF RN_ST
+          wc: REG_ID TM_FC TM_EF MOD STN C MIN MAX MIN_L MIN_H MAX_L MAX_H
+        가장 최근 발표분만 쓰고, 오전·오후(A02)로 나뉜 날은 하루로 합친다.
+        """
+        reg = mid_land_reg(land_reg)
+        if not reg:
+            return []
+        land_txt = await self._request("fct_afs_wl.php", {"reg": reg, "disp": 1, "help": 0})
+        ta_txt = await self._request("fct_afs_wc.php", {"reg": land_reg, "disp": 1, "help": 0})
+
+        def latest(txt: str) -> list[list[str]]:
+            rows = [c for c in (_mid_cols(x) for x in iter_data_lines(txt)) if len(c) >= 8]
+            top = max((r[1] for r in rows), default="")
+            return [r for r in rows if r[1] == top]
+
+        days: dict[str, dict[str, Any]] = {}
+        for c in latest(land_txt):
+            d = days.setdefault(c[2][:8], {"wf": [], "pop": []})
+            # WF 는 CONF 뒤의 한글 열. CONF 가 "없음" 이면 "없음 구름많음" 처럼 붙어 오기도 한다
+            texts = [re.sub(r"^없음\s+", "", x) for x in c[8:] if re.search("[가-힣]", x)]
+            texts = [x for x in texts if x and x != "없음"]
+            if texts:
+                d["wf"].append(texts[-1])
+            if c[-1].isdigit():
+                d["pop"].append(int(c[-1]))
+        for c in latest(ta_txt):
+            d = days.setdefault(c[2][:8], {"wf": [], "pop": []})
+            d["min"], d["max"] = _to_int(c[6]), _to_int(c[7])
+
+        def worst(wfs: list[str]) -> str:     # 오전·오후 중 비·눈이 있는 쪽을 대표로
+            return next((w for w in wfs if re.search("비|눈|소나기", w)), wfs[-1] if wfs else "")
+
+        out = [MidForecast(date=k, wf=worst(v["wf"]), pop=max(v["pop"]) if v["pop"] else None,
+                           ta_min=v.get("min"), ta_max=v.get("max"))
+               for k, v in sorted(days.items()) if v["wf"] or v.get("max") is not None]
+        _LOGGER.debug("중기예보 %d일 파싱(reg=%s/%s)", len(out), reg, land_reg)
         return out
 
     async def async_get_marine_forecast(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -128,6 +129,7 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
 
         # API별 누적 에러 카운트 / 마지막 에러 시각 (HA 재시작 전까지 유지)
         self._init_api_status(API_STATUS_ZONE_KEYS)
+        self._mid_next = 0.0      # 중기예보 다음 조회 시각(monotonic). 하루 두 번 발표라 자주 볼 필요 없다
         self._refresh_meta: dict[str, bool] = {
             "village_stale": False,
             "land_stale": False,
@@ -264,6 +266,9 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
             _LOGGER.debug("육상예보 데이터가 비어 있어 이전 값을 유지합니다.")
         else:
             data["land"] = land
+
+        # 2-1. 중기예보(4~10일). 첫 조회는 건너뛰어 기동을 늦추지 않고, 미신청(403)이면 6시간마다만 확인한다
+        data["mid"] = await self._fetch_mid() if self.data is not None else []
 
         # 3. 해상예보 (fct_afs_do.php)
         marine, status["marine_forecast"] = opt["marine"]
@@ -402,6 +407,23 @@ class KmaForecastCoordinator(_ApiStatusMixin, DataUpdateCoordinator[dict[str, An
 
         self._refresh_meta = refresh_meta
         return data
+
+    async def _fetch_mid(self) -> list:
+        prev = (self.data or {}).get("mid", [])
+        if time.monotonic() < self._mid_next:
+            return prev
+        try:
+            mid = await self.client.async_get_mid_forecast(self.land_reg)
+        except KmaActivationRequiredError:
+            _LOGGER.debug("중기예보 미신청(403). 6시간 뒤 다시 확인합니다.")
+            self._mid_next = time.monotonic() + 6 * 3600
+            return prev
+        except KmaApiError as err:
+            _LOGGER.debug("중기예보 실패: %s", err)
+            self._mid_next = time.monotonic() + 3600
+            return prev
+        self._mid_next = time.monotonic() + 3 * 3600
+        return mid or prev
 
     async def _fetch_optional(
         self, label: str, coro: Any, *, default: Any = None

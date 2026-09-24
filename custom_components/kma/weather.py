@@ -26,7 +26,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .api import LandForecast, VillageForecast
+from .api import LandForecast, MidForecast, VillageForecast
 from .const import DOMAIN
 from .coordinator import KmaForecastCoordinator
 from .helpers import parse_pcp
@@ -67,9 +67,26 @@ def get_ha_condition(sky: str | None, pty: str | None, is_night: bool) -> str:
     return ATTR_CONDITION_CLOUDY  # 기본 폴백
 
 
+def mid_condition(wf: str) -> str:
+    """중기예보 문구(예: "구름많고 비") → HA 날씨 상태."""
+    rain, snow = ("비" in wf or "소나기" in wf), "눈" in wf
+    if rain and snow:
+        return ATTR_CONDITION_SNOWY_RAINY
+    if snow:
+        return ATTR_CONDITION_SNOWY
+    if rain:
+        return ATTR_CONDITION_RAINY
+    if "흐" in wf:
+        return ATTR_CONDITION_CLOUDY
+    if "구름" in wf:
+        return ATTR_CONDITION_PARTLYCLOUDY
+    return ATTR_CONDITION_SUNNY
+
+
 def aggregate_daily_forecasts(
     village_forecasts: list[VillageForecast],
-    land_forecasts: list[LandForecast]
+    land_forecasts: list[LandForecast],
+    mid_forecasts: list[MidForecast] | None = None,
 ) -> list[Forecast]:
     """시간별 단기예보 및 중기 육상예보를 병합하여 일별 예보 리스트를 생성합니다."""
     daily_forecasts: dict[str, dict[str, Any]] = {}
@@ -228,7 +245,26 @@ def aggregate_daily_forecasts(
             )
         )
 
-    return result
+    # 4. 중기예보(MidForecast) — 단기·육상예보에 없는 날만 (4~10일차)
+    covered = existing_dates | set(land_by_date)
+    for mf in mid_forecasts or []:
+        if mf.date in covered or mf.ta_max is None:
+            continue
+        try:
+            dt = datetime.datetime.strptime(mf.date, "%Y%m%d")  # noqa: DTZ007
+        except ValueError:
+            continue
+        result.append(
+            Forecast(
+                datetime=dt_util.as_utc(dt_util.as_local(dt)).isoformat(),
+                condition=mid_condition(mf.wf),
+                native_temperature=mf.ta_max,
+                native_templow=mf.ta_min,
+                precipitation_probability=mf.pop,
+            )
+        )
+
+    return sorted(result, key=lambda f: f["datetime"])
 
 
 async def async_setup_entry(
@@ -347,7 +383,8 @@ class KmaWeather(CoordinatorEntity[KmaForecastCoordinator], WeatherEntity):
         """일별 예보 생성."""
         village: list[VillageForecast] = self.coordinator.data.get("village", [])
         land: list[LandForecast] = self.coordinator.data.get("land", [])
-        return aggregate_daily_forecasts(village, land)
+        mid: list[MidForecast] = self.coordinator.data.get("mid", [])
+        return aggregate_daily_forecasts(village, land, mid)
 
     async def async_forecast_daily(self) -> list[Forecast] | None:
         """일별 예보 반환."""
@@ -360,7 +397,11 @@ class KmaWeather(CoordinatorEntity[KmaForecastCoordinator], WeatherEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """추가 속성 반환 (예보요약, 특보목록)."""
-        attrs = {}
+        attrs = {
+            # 구역 좌표: 카드가 기상청 예보 이후 날짜를 다른 출처로 채울 때 쓴다
+            "latitude": self.coordinator.lat,
+            "longitude": self.coordinator.lon,
+        }
 
         # 1. 육상예보 요약
         land = self.coordinator.data.get("land", [])
